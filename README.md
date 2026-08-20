@@ -6,7 +6,7 @@ ChemRender3D integrates the powerful [Mol* (Molstar)](https://molstar.org/) view
 
 ### Quick Demo
 
-<img width="837" height="1006" alt="Image" src="https://github.com/user-attachments/assets/aebdae74-1893-45bb-80eb-b0e2e3112faa" />
+<img width="800" height="956" alt="Image" src="https://github.com/user-attachments/assets/62d7cec3-1d4e-4330-a980-5836fa31b229" />
 
 ## ✨ Features
 
