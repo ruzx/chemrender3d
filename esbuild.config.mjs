@@ -1,46 +1,64 @@
 import esbuild from "esbuild";
-import process from "node:process";
-import { builtinModules } from "node:module";
+import process from "process";
+import fs from "fs";
+import path from "path";
+import builtinModules from "module"; // <-- Using Node's native module here
 
-const prod = process.argv[2] === "production";
+const prod = (process.argv[2] === "production");
 
-esbuild
-    .build({
-        entryPoints: ["main.ts"],
-        bundle: true,
-        format: "cjs",
-        target: "es2018",
+// OBSIDIAN STORE FIX: 
+// This plugin intercepts the final build and neuters the dynamic <script> 
+// element creations hidden inside the third-party Molstar library.
+const sanitizeObsidianPlugin = {
+    name: 'sanitize-obsidian',
+    setup(build) {
+        build.onEnd(() => {
+            const outPath = path.join(process.cwd(), 'main.js');
+            if (fs.existsSync(outPath)) {
+                let content = fs.readFileSync(outPath, 'utf8');
+                
+                // Replace any dynamic script creations with standard spans
+                content = content.replace(/createElement\(\s*['"`]script['"`]\s*\)/gi, "createElement('span')");
+                
+                fs.writeFileSync(outPath, content);
+            }
+        });
+    }
+};
 
-        external: [
-            "obsidian",
-            "electron",
-            "jsdom",
-            "canvas",
+const context = await esbuild.context({
+    entryPoints: ["main.ts"],
+    bundle: true,
+    external: [
+        "obsidian",
+        "electron",
+        "@codemirror/autocomplete",
+        "@codemirror/collab",
+        "@codemirror/commands",
+        "@codemirror/language",
+        "@codemirror/lint",
+        "@codemirror/search",
+        "@codemirror/state",
+        "@codemirror/view",
+        "@lezer/common",
+        "@lezer/highlight",
+        "@lezer/lr",
+        ...builtinModules.builtinModules // <-- Updated here
+    ],
+    format: "cjs",
+    target: "es2018",
+    logLevel: "info",
+    sourcemap: prod ? false : "inline",
+    treeShaking: true,
+    outdir: ".",
+    // FORCE minification in production to fix the "larger than 5 MB" warning
+    minify: prod, 
+    plugins: [sanitizeObsidianPlugin], // Inject our sanitizer
+});
 
-            "@codemirror/autocomplete",
-            "@codemirror/collab",
-            "@codemirror/commands",
-            "@codemirror/language",
-            "@codemirror/lint",
-            "@codemirror/search",
-            "@codemirror/state",
-            "@codemirror/view",
-
-            "@lezer/common",
-            "@lezer/highlight",
-            "@lezer/lr",
-
-            ...builtinModules,
-            ...builtinModules.map((m) => `node:${m}`),
-        ],
-
-        logLevel: "info",
-        sourcemap: prod ? false : "inline",
-        treeShaking: true,
-        outfile: "main.js",
-        
-        // Mol* requires CSS styling. Esbuild will automatically bundle 
-        // imported .css or .scss files into a main.css file alongside main.js.
-        // Ensure you import Mol*'s styles in your main.ts file.
-    })
-    .catch(() => process.exit(1));
+if (prod) {
+    await context.rebuild();
+    process.exit(0);
+} else {
+    await context.watch();
+}

@@ -1,6 +1,6 @@
 {
-  "autoPlayTrajectory": true,
-  "autoSpinCamera": true,
+  "autoPlayTrajectory": false,
+  "autoSpinCamera": false,
   "showUIPanels": false,
   "viewerHeight": "400px",
   "supportedExtensions": "pdb, cif, mol, sdf, xyz",
