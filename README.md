@@ -6,7 +6,7 @@ ChemRender3D integrates the powerful [Mol* (Molstar)](https://molstar.org/) view
 
 ### Quick Demo
 
-*(Insert GIF/Video of a rotating protein here)*
+<img width="837" height="1006" alt="Image" src="https://github.com/user-attachments/assets/aebdae74-1893-45bb-80eb-b0e2e3112faa" />
 
 ## ✨ Features
 
@@ -29,7 +29,7 @@ Drop a `.pdb` or `.xyz` file into your vault and embed it normally. ChemRender3D
 ```
 
 ### 2. SMILES to 3D (No files needed)
-Use a `3dmol` code block with a SMILES string. The plugin will fetch the 3D coordinates on the fly.
+Use a `3dmol` code block with a SMILES string. The plugin will fetch the 3D coordinates on the fly. (No MM optimization, only for showcasing/teaching)
 
 ````markdown
 ```3dmol
@@ -48,9 +48,8 @@ You can also use a code block to reference files if you prefer not to use native
 
 ---
 
-## ⚙️ Pro-Tips & Settings
+## ⚙️ Tips & Settings
 
-- **Illustrative Mode:** Go to settings and change the default preset to *Illustrative* for stunning, textbook-quality watercolor renders of proteins.
 - **Performance Cap:** If you are on a 4K or Retina display and notice lag, lower the **Max Pixel Ratio** in the plugin settings to `1.0` to double your frame rate.
 - **Auto-Spin:** Turn on Auto-Spin in the settings to make your embedded molecules slowly rotate on the page.
 
@@ -58,3 +57,6 @@ You can also use a code block to reference files if you prefer not to use native
 1. Open **Settings → Community plugins**.
 2. Click **Browse** and search for **ChemRender3D**.
 3. Click **Install** and then **Enable**.
+
+
+Acknolegment: Mol* (/'molstar/) is a modern web-based open-source toolkit for visualisation and analysis of large-scale molecular data
