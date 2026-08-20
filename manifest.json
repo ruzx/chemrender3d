@@ -1,0 +1,9 @@
+{
+  "id": "chemrender3d",
+  "name": "ChemRender3D",
+  "version": "1.0.0",
+  "minAppVersion": "1.0.0",
+  "description": "Render beautiful 3D structures using Mol*.",
+  "author": "Ruzal Sitdikov",
+  "isDesktopOnly": true
+}

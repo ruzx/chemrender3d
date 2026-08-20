@@ -1,0 +1,11 @@
+{
+  "autoPlayTrajectory": true,
+  "autoSpinCamera": true,
+  "showUIPanels": false,
+  "viewerHeight": "400px",
+  "supportedExtensions": "pdb, cif, mol, sdf, xyz",
+  "showNonCovalent": false,
+  "maxPixelRatio": 1,
+  "preventAppClick": true,
+  "defaultPreset": "default"
+}
