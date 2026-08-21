@@ -1,6 +1,6 @@
 {
   "name": "chemrender",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Render beautiful 3D structures using Mol*.",
   "main": "main.js",
   "scripts": {

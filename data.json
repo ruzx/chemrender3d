@@ -7,5 +7,6 @@
   "showNonCovalent": false,
   "maxPixelRatio": 1,
   "preventAppClick": true,
-  "defaultPreset": "default"
+  "defaultPreset": "auto",
+  "gridMaxFiles": 12
 }

@@ -20,7 +20,8 @@ interface ChemRender3DSettings {
     showNonCovalent: boolean;
     maxPixelRatio: number;
     preventAppClick: boolean;
-    defaultPreset: 'default' | 'illustrative' | 'polymer-and-ligand' | 'ball-and-stick';
+    defaultPreset: 'auto' | 'illustrative' | 'polymer-and-ligand' | 'ball-and-stick';
+    gridMaxFiles: number;
 }
 
 const DEFAULT_SETTINGS: ChemRender3DSettings = {
@@ -32,7 +33,8 @@ const DEFAULT_SETTINGS: ChemRender3DSettings = {
     showNonCovalent: false,
     maxPixelRatio: 1.0,
     preventAppClick: true,
-    defaultPreset: 'default'
+    defaultPreset: 'auto',
+    gridMaxFiles: 12
 }
 
 // --- Supported Format Mapping ---
@@ -90,7 +92,6 @@ class MolstarRenderChild extends MarkdownRenderChild {
             viewerContainer.addEventListener('dblclick', stopEvent);
         }
 
-        // AGGRESSIVE SILENCER for Molstar's RxJS Duplicate Symbol Warnings
         const origWarn = console.warn;
         const origError = console.error;
         const origLog = console.log;
@@ -149,8 +150,12 @@ class MolstarRenderChild extends MarkdownRenderChild {
             const data = await this.pluginInstance.builders.data.rawData({ data: rawStringData });
             const trajectory = await this.pluginInstance.builders.structure.parseTrajectory(data, parsedFormat);
             
-            // Apply the user's preferred visual style
-            const preset = await this.pluginInstance.builders.structure.hierarchy.applyPreset(trajectory, this.settings.defaultPreset);
+            // --- FIX FOR PRESETS ---
+            // We must explicitly build the Model and Structure BEFORE applying representation presets!
+            const model = await this.pluginInstance.builders.structure.createModel(trajectory);
+            const structure = await this.pluginInstance.builders.structure.createStructure(model);
+            
+            await this.pluginInstance.builders.structure.representation.applyPreset(structure, this.settings.defaultPreset);
 
             const isDark = document.body.classList.contains('theme-dark');
             const bgColor = isDark ? Color(0x1e1e1e) : Color(0xffffff); 
@@ -168,10 +173,10 @@ class MolstarRenderChild extends MarkdownRenderChild {
                 }
             }
 
-            if (this.settings.showNonCovalent && preset && preset.structure) {
+            if (this.settings.showNonCovalent && structure) {
                 try {
                     await this.pluginInstance.builders.structure.representation.addRepresentation(
-                        preset.structure, 
+                        structure, 
                         { type: 'noncovalent-interactions' }
                     );
                 } catch (err) {
@@ -192,9 +197,8 @@ class MolstarRenderChild extends MarkdownRenderChild {
             }
             
         } catch (err) {
-            this.containerEl.createEl('div', { text: `Error loading 3D model: ${err}`, cls: "color-red" });
+            this.containerEl.createEl('div', { text: `Error loading 3D model: ${err}`, cls: "color-red", style: "padding: 10px;" });
         } finally {
-            // Restore normal console logging behavior
             console.warn = origWarn;
             console.error = origError;
             console.log = origLog;
@@ -220,6 +224,7 @@ export default class ChemRender3DPlugin extends Plugin {
         await this.loadSettings();
         this.addSettingTab(new ChemRender3DSettingTab(this.app, this));
 
+        // 1. Standard 3D Block Processor
         this.registerMarkdownCodeBlockProcessor('3dmol', (source, el, ctx) => {
             const sourceTrimmed = source.trim();
             const filenameMatch = sourceTrimmed.match(/^!?\[\[(.*?)\]\]$/);
@@ -234,6 +239,61 @@ export default class ChemRender3DPlugin extends Plugin {
             }
         });
 
+        // 2. NEW Feature: 3DMol Grid Processor (Folder Preview)
+        this.registerMarkdownCodeBlockProcessor('3dmol-grid', async (source, el, ctx) => {
+            const folderMatch = source.match(/folder:\s*(.+)/i);
+            if (!folderMatch) {
+                el.createEl('div', { text: 'ChemRender3D Grid Error: Provide a folder path (e.g., "folder: Assets/Molecules")', cls: 'color-red' });
+                return;
+            }
+
+            const folderPath = folderMatch[1].trim();
+            const folder = this.app.vault.getAbstractFileByPath(folderPath);
+
+            if (!folder || !('children' in folder)) {
+                el.createEl('div', { text: `ChemRender3D Grid Error: Folder not found "${folderPath}"`, cls: 'color-red' });
+                return;
+            }
+
+            const files = folder.children
+                .filter(f => f instanceof TFile && FORMAT_MAP[f.extension.toLowerCase()])
+                .slice(0, this.settings.gridMaxFiles);
+
+            if (files.length === 0) {
+                el.createEl('div', { text: `No supported 3D molecules found in "${folderPath}".` });
+                return;
+            }
+
+            const gridContainer = el.createDiv({ style: 'display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 15px; margin-top: 10px;' });
+
+            // Customize settings specifically for grid items to keep it clean and performant
+            const gridSettings: ChemRender3DSettings = {
+                ...this.settings,
+                showUIPanels: false,
+                autoSpinCamera: false, // Prevents chaos when 12 models are spinning at once
+                viewerHeight: '200px',
+                preventAppClick: true
+            };
+
+            for (const file of files) {
+                const cell = gridContainer.createDiv({ style: 'display: flex; flex-direction: column; gap: 5px; background: var(--background-secondary); padding: 8px; border-radius: 8px; border: 1px solid var(--background-modifier-border);' });
+                
+                const title = cell.createDiv({ text: file.name, style: 'text-align: center; font-size: 0.9em; font-weight: bold; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;' });
+                title.title = file.name;
+
+                const viewerEl = cell.createDiv();
+                const renderData: RenderData = { type: 'file', content: file.path, sourcePath: ctx.sourcePath };
+                
+                const child = new MolstarRenderChild(viewerEl, renderData, this.app, gridSettings);
+                ctx.addChild(child);
+            }
+
+            if (folder.children.length > this.settings.gridMaxFiles) {
+                el.createDiv({ text: `Showing first ${this.settings.gridMaxFiles} files. Edit Grid Max Files in settings to see more.`, style: 'text-align: center; margin-top: 10px; font-size: 0.85em; color: var(--text-muted);' });
+            }
+        });
+
+        // 3. Post Processor for native ![[file.ext]]
         this.registerMarkdownPostProcessor((element, context) => {
             const embeds = Array.from(element.querySelectorAll('.internal-embed'));
             if (element.classList?.contains('internal-embed')) embeds.push(element);
@@ -402,7 +462,7 @@ class ChemRender3DSettingTab extends PluginSettingTab {
             .setName('Default Visual Preset')
             .setDesc('Choose the default visual style for rendered molecules. (Illustrative mode looks stunning for proteins!).')
             .addDropdown(dropdown => dropdown
-                .addOption('default', 'Default (Standard)')
+                .addOption('auto', 'Default (Standard)')
                 .addOption('illustrative', 'Illustrative (David Goodsell style)')
                 .addOption('polymer-and-ligand', 'Polymer & Ligand')
                 .addOption('ball-and-stick', 'Ball and Stick')
@@ -410,6 +470,20 @@ class ChemRender3DSettingTab extends PluginSettingTab {
                 .onChange(async (value: any) => {
                     this.plugin.settings.defaultPreset = value;
                     await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Grid Max Files')
+            .setDesc('Maximum number of molecules to render when using the 3dmol-grid folder viewer. Keep this under 20 to prevent WebGL memory crashes.')
+            .addText(text => text
+                .setPlaceholder('12')
+                .setValue(this.plugin.settings.gridMaxFiles.toString())
+                .onChange(async (value) => {
+                    const parsed = parseInt(value);
+                    if (!isNaN(parsed)) {
+                        this.plugin.settings.gridMaxFiles = parsed;
+                        await this.plugin.saveSettings();
+                    }
                 }));
 
         new Setting(containerEl)

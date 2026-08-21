@@ -2,34 +2,36 @@
 
 **Bring interactive 3D molecules to Obsidian.**
 
-ChemRender3D integrates the powerful [Mol* (Molstar)](https://molstar.org/) viewer directly into your vault. Effortlessly view, rotate, and interact with complex proteins, crystal structures, and small molecules natively inside your notes.
+ChemRender3D brings the [Mol*](https://molstar.org/) molecular viewer directly into your vault. Visualize and explore proteins, crystal structures, and small molecules without leaving your notes.
 
-### Quick Demo
+<img width="800" alt="ChemRender3D demo" src="https://github.com/user-attachments/assets/62d7cec3-1d4e-4330-a980-5836fa31b229" />
 
-<img width="800" height="956" alt="Image" src="https://github.com/user-attachments/assets/62d7cec3-1d4e-4330-a980-5836fa31b229" />
+## Features
 
-## ✨ Features
+* **Native embeds** — Render `.pdb`, `.cif`, `.mol`, `.sdf`, `.xyz`, and other supported molecular files.
+* **SMILES to 3D** — Generate and visualize 3D molecular structures directly from SMILES.
+* **Interactive visualization** — Rotate, zoom, and inspect structures inside your notes.
+* **Multiple representations** — Explore structures using molecular, ribbon, surface, and illustrative styles.
+* **Molecular interactions** — Detect hydrogen bonds, salt bridges, and other non-covalent interactions.
+* **Performance controls** — Adjust rendering quality for large molecular structures.
 
-- **Native File Support:** Render `.pdb`, `.cif`, `.mol`, `.sdf`, `.xyz`, and more using standard Obsidian embeds (`![[protein.pdb]]`).
-- **SMILES to 3D:** Type a simple SMILES string and automatically generate a 3D structure.
-- **Beautiful Presets:** View structures in standard ribbon formats, or use the stunning "Illustrative" (David Goodsell) art style.
-- **High Performance:** Configurable pixel-ratio caps ensure Obsidian runs smoothly, even with massive Ribosome or Viral structures.
-- **Smart Interactions:** Auto-calculates hydrogen bonds, salt bridges, and non-covalent interactions.
+## Usage
 
----
+### Embed molecular files
 
-## 🚀 How to Use
-
-### 1. Native File Embeds (The Easy Way)
-Drop a `.pdb` or `.xyz` file into your vault and embed it normally. ChemRender3D automatically replaces it with a fully interactive 3D viewer.
+Embed a supported file directly in your note:
 
 ```markdown
 ![[hemoglobin.pdb]]
+
 ![[caffeine.sdf]]
 ```
 
-### 2. SMILES to 3D (No files needed)
-Use a `3dmol` code block with a SMILES string. The plugin will fetch the 3D coordinates on the fly. (No MM optimization, only for showcasing/teaching)
+ChemRender3D automatically replaces the file embed with an interactive 3D viewer.
+
+### Generate a structure from SMILES
+
+Use a `3dmol` code block:
 
 ````markdown
 ```3dmol
@@ -37,8 +39,11 @@ CC(=O)OC1=CC=CC=C1C(=O)O
 ```
 ````
 
-### 3. Explicit File Blocks
-You can also use a code block to reference files if you prefer not to use native embeds:
+Note: The 3D coordinates from SMILES are generated for visualization and are not intended for geometry optimization or computational analysis.
+
+### Reference a file
+
+Alternatively, reference a molecular file inside a `3dmol` block:
 
 ````markdown
 ```3dmol
@@ -46,17 +51,17 @@ You can also use a code block to reference files if you prefer not to use native
 ```
 ````
 
----
+## Settings
 
-## ⚙️ Tips & Settings
+* **Max Pixel Ratio** — Reduce this value on high-resolution displays to improve rendering performance.
+* **Auto-Spin** — Automatically rotate embedded structures.
 
-- **Performance Cap:** If you are on a 4K or Retina display and notice lag, lower the **Max Pixel Ratio** in the plugin settings to `1.0` to double your frame rate.
-- **Auto-Spin:** Turn on Auto-Spin in the settings to make your embedded molecules slowly rotate on the page.
+## Installation
 
-## 📥 Installation
-1. Open **Settings → Community plugins**.
-2. Click **Browse** and search for **ChemRender3D**.
-3. Click **Install** and then **Enable**.
+1. Open **Settings → Community plugins → Browse**.
+2. Search for **ChemRender3D**.
+3. Install and enable the plugin.
 
+## Acknowledgment
 
-Acknolegment: Mol* (/'molstar/) is a modern web-based open-source toolkit for visualisation and analysis of large-scale molecular data
+ChemRender3D is powered by [Mol*](https://molstar.org/), an open-source toolkit for visualization and analysis of large-scale molecular data.
