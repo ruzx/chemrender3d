@@ -15,6 +15,19 @@ ChemRender3D brings the [Mol*](https://molstar.org/) molecular viewer directly i
 * **Molecular interactions** — Detect hydrogen bonds, salt bridges, and other non-covalent interactions.
 * **Performance controls** — Adjust rendering quality for large molecular structures.
 
+🗂️ **New Feature: Folder Grid Preview** 
+Want to see all your molecules at a glance? You can now generate a beautiful, responsive gallery of all 3D molecules in a specific folder. 
+Just use this code block:
+````markdown
+```3dmol-grid
+folder: Assets/Molecules
+```
+````
+example:
+<img width="829" height="782" alt="Image" src="https://github.com/user-attachments/assets/c736fa80-7824-4715-b2d0-ca3ed2e22830" />
+
+
+
 ## Usage
 
 ### Embed molecular files
