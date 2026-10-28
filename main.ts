@@ -38,7 +38,12 @@ const ELEMENT_DATA: Record<string, { name: string; number: number; mass: number;
     Ba: { name: 'Barium', number: 56, mass: 137.33, color: '#00C900' }
 };
 
-interface RenderData {
+interface EmbedSize {
+    width?: string;
+    height?: string;
+}
+
+interface RenderData extends EmbedSize {
     type: 'file' | 'smiles' | 'pdb' | 'afdb' | 'pubchem' | 'raw_vasp';
     content: string;
     sourcePath: string;
@@ -67,7 +72,7 @@ const DEFAULT_SETTINGS: ChemRender3DSettings = {
     showUIPanels: false,
     showQuickToolbar: true,
     viewerHeight: '400px',
-    supportedExtensions: 'pdb, ent, pdbqt, pqr, cif, mmcif, gro, mol, mol2, sdf, sd, xyz, cube, cub, poscar, contcar, xdatcar, vasp, gjf, com, in, pwi',
+    supportedExtensions: 'pdb, ent, pdbqt, pqr, cif, mmcif, gro, mol, mol2, sdf, sd, xyz, cube, cub, poscar, contcar, xdatcar, vasp, gjf, com, in, pwi, molx, molj',
     showNonCovalent: false,
     maxPixelRatio: 1.0,
     preventAppClick: true,
@@ -100,8 +105,17 @@ const FORMAT_MAP: Record<string, string> = {
     'gjf': 'gaussian',
     'com': 'gaussian',
     'in': 'qe',
-    'pwi': 'qe'
+    'pwi': 'qe',
+    'molx': 'molx',
+    'molj': 'molj'
 };
+
+// Mol* session files (.molx zipped, .molj plain JSON) are whole saved plugin states:
+// they carry their own structures, representations, colours and camera, so they bypass
+// the parse-and-apply-a-preset pipeline the other formats go through.
+function isSessionFormat(format: string | null): boolean {
+    return format === 'molx' || format === 'molj';
+}
 
 function getActiveExtensions(settings: ChemRender3DSettings): string[] {
     return settings.supportedExtensions
@@ -117,6 +131,57 @@ function isFileSupported(cleanSrc: string, settings: ChemRender3DSettings): bool
     const lower = cleanSrc.toLowerCase();
     if (lower.includes('poscar') || lower.includes('contcar') || lower.includes('xdatcar')) return true;
     return false;
+}
+
+/**
+ * Read Obsidian's embed size suffix: `|WIDTH` or `|WIDTHxHEIGHT`, in pixels.
+ * Anything before the last `|` is display text, so only the last segment is tried,
+ * and a segment that is not a size (a caption, say) leaves the viewer at its default.
+ */
+function parseEmbedSize(link: string): EmbedSize {
+    const spec = link.split('|').pop()?.trim() || '';
+    const match = spec.match(/^([1-9]\d*)(?:\s*[x\u00d7]\s*([1-9]\d*))?$/i);
+    if (!match) return {};
+    return {
+        width: `${match[1]}px`,
+        // As with images, a width on its own leaves the height alone.
+        height: match[2] ? `${match[2]}px` : undefined
+    };
+}
+
+/** Match the host embed element to the viewer, so an inline embed is not left full width. */
+function applyHostWidth(embed: HTMLElement, size: EmbedSize): void {
+    if (size.width) embed.style.width = size.width;
+    else embed.style.removeProperty('width');
+}
+
+/** Split an embed target into the vault path and the size that was asked for. */
+function parseEmbedLink(raw: string): { path: string; size: EmbedSize } {
+    const decoded = decodeURIComponent(raw);
+    return {
+        path: decoded.split('#')[0].split('?')[0].split('|')[0].trim(),
+        size: parseEmbedSize(decoded)
+    };
+}
+
+/**
+ * Size of a rendered embed element. Obsidian may leave the suffix in `src`, move it to
+ * `alt`, or split it into `width`/`height` attributes, so all three are checked.
+ */
+function parseEmbedElementSize(embed: Element, src: string): EmbedSize {
+    const widthAttr = embed.getAttribute('width') || '';
+    if (/^[1-9]\d*$/.test(widthAttr)) {
+        const heightAttr = embed.getAttribute('height') || '';
+        return {
+            width: `${widthAttr}px`,
+            height: /^[1-9]\d*$/.test(heightAttr) ? `${heightAttr}px` : undefined
+        };
+    }
+
+    const fromSrc = parseEmbedSize(decodeURIComponent(src));
+    if (fromSrc.width) return fromSrc;
+
+    return parseEmbedSize(embed.getAttribute('alt') || '');
 }
 
 function resolveVaultFile(app: App, linkpath: string, sourcePath: string): TFile | null {
@@ -536,6 +601,7 @@ class MolstarRenderChild extends MarkdownRenderChild {
     explicitBondsList: { a1: number; a2: number; type: number }[] = [];
     clickHistory: { sym: string; x: number; y: number; z: number }[] = [];
     inspectorEl: HTMLElement | null = null;
+    rootWrapper: HTMLElement | null = null;
 
     constructor(containerEl: HTMLElement, renderData: RenderData, pluginApp: App, settings: ChemRender3DSettings) {
         super(containerEl);
@@ -546,9 +612,11 @@ class MolstarRenderChild extends MarkdownRenderChild {
 
     async onload() {
         const rootWrapper = this.containerEl.createDiv({ cls: 'chem3d-root-wrapper' });
+        this.rootWrapper = rootWrapper;
         rootWrapper.style.position = 'relative';
-        rootWrapper.style.width = '100%';
-        rootWrapper.style.height = this.settings.viewerHeight;
+        rootWrapper.style.width = this.renderData.width || '100%';
+        rootWrapper.style.height = this.renderData.height || this.settings.viewerHeight;
+        rootWrapper.style.maxWidth = '100%';
         rootWrapper.style.borderRadius = '8px';
         rootWrapper.style.overflow = 'hidden';
         rootWrapper.style.border = '1px solid var(--background-modifier-border)';
@@ -615,6 +683,7 @@ class MolstarRenderChild extends MarkdownRenderChild {
             let rawStringData = "";
             let parsedFormat = "";
             let formulaLabel = "";
+            let sessionFile: TFile | null = null;
 
             if (this.renderData.type === 'raw_vasp') {
                 const supercell = this.renderData.supercell || this.settings.poscarSupercell;
@@ -639,37 +708,44 @@ class MolstarRenderChild extends MarkdownRenderChild {
                     return;
                 }
 
-                const fileText = await this.pluginApp.vault.read(file);
-
-                if (detected === 'mol' || detected === 'sdf') {
-                    const res = parseMolFile(fileText);
-                    this.parsedAtomsList = res.atoms;
-                    this.explicitBondsList = res.bonds;
-                    formulaLabel = res.formula;
-                    rawStringData = fileText;
+                if (isSessionFormat(detected)) {
+                    // .molx is a zip archive, so it must never go through vault.read().
+                    sessionFile = file;
                     parsedFormat = detected;
-                } else if (detected === 'vasp') {
-                    const supercell = this.renderData.supercell || this.settings.poscarSupercell;
-                    const res = convertPoscarToPdb(fileText, supercell);
-                    rawStringData = res.pdbText;
-                    formulaLabel = res.formula;
-                    this.parsedAtomsList = res.atoms;
-                    parsedFormat = 'pdb';
-                } else if (detected === 'xyz' || detected === 'xdatcar') {
-                    const res = convertXyzToPdb(fileText);
-                    rawStringData = res.pdbText;
-                    formulaLabel = res.formula;
-                    this.parsedAtomsList = res.atoms;
-                    parsedFormat = 'pdb';
-                } else if (detected === 'gaussian' || detected === 'qe') {
-                    const res = convertGaussianToPdb(fileText);
-                    rawStringData = res.pdbText;
-                    formulaLabel = res.formula;
-                    this.parsedAtomsList = res.atoms;
-                    parsedFormat = 'pdb';
+                    formulaLabel = file.basename;
                 } else {
-                    rawStringData = fileText;
-                    parsedFormat = detected;
+                    const fileText = await this.pluginApp.vault.read(file);
+
+                    if (detected === 'mol' || detected === 'sdf') {
+                        const res = parseMolFile(fileText);
+                        this.parsedAtomsList = res.atoms;
+                        this.explicitBondsList = res.bonds;
+                        formulaLabel = res.formula;
+                        rawStringData = fileText;
+                        parsedFormat = detected;
+                    } else if (detected === 'vasp') {
+                        const supercell = this.renderData.supercell || this.settings.poscarSupercell;
+                        const res = convertPoscarToPdb(fileText, supercell);
+                        rawStringData = res.pdbText;
+                        formulaLabel = res.formula;
+                        this.parsedAtomsList = res.atoms;
+                        parsedFormat = 'pdb';
+                    } else if (detected === 'xyz' || detected === 'xdatcar') {
+                        const res = convertXyzToPdb(fileText);
+                        rawStringData = res.pdbText;
+                        formulaLabel = res.formula;
+                        this.parsedAtomsList = res.atoms;
+                        parsedFormat = 'pdb';
+                    } else if (detected === 'gaussian' || detected === 'qe') {
+                        const res = convertGaussianToPdb(fileText);
+                        rawStringData = res.pdbText;
+                        formulaLabel = res.formula;
+                        this.parsedAtomsList = res.atoms;
+                        parsedFormat = 'pdb';
+                    } else {
+                        rawStringData = fileText;
+                        parsedFormat = detected;
+                    }
                 }
 
             } else if (this.renderData.type === 'smiles' || this.renderData.type === 'pubchem') {
@@ -721,9 +797,11 @@ class MolstarRenderChild extends MarkdownRenderChild {
                 formulaLabel = `AlphaFold: ${uniprotId}`;
             }
 
-            const data = await this.pluginInstance.builders.data.rawData({ data: rawStringData });
-
-            if (parsedFormat === 'cube') {
+            if (sessionFile) {
+                await this.loadSession(sessionFile);
+                this.attachInteractions();
+            } else if (parsedFormat === 'cube') {
+                const data = await this.pluginInstance.builders.data.rawData({ data: rawStringData });
                 const volume = await this.pluginInstance.builders.volume.parseVolume(data, 'cube');
                 await this.pluginInstance.builders.volume.representation.addIsosurface(volume, {
                     alpha: 0.8,
@@ -736,6 +814,7 @@ class MolstarRenderChild extends MarkdownRenderChild {
                     colorTheme: { name: 'uniform', value: Color(0xff3333) }
                 });
             } else {
+                const data = await this.pluginInstance.builders.data.rawData({ data: rawStringData });
                 const trajectory = await this.pluginInstance.builders.structure.parseTrajectory(data, parsedFormat);
                 const model = await this.pluginInstance.builders.structure.createModel(trajectory);
                 const structure = await this.pluginInstance.builders.structure.createStructure(model);
@@ -762,68 +841,7 @@ class MolstarRenderChild extends MarkdownRenderChild {
                     this.pluginInstance?.canvas3d?.requestCameraReset({ durationMs: 0 });
                 }, 100);
 
-                // Live Hover Feedback
-                this.pluginInstance.behaviors.interaction.hover.subscribe((event: any) => {
-                    const loci = event.current.loci;
-                    if (loci && loci.kind === 'element-loci') {
-                        try {
-                            const unit = loci.elements[0]?.unit;
-                            const idx = loci.elements[0]?.indices[0];
-                            if (unit && idx !== undefined && this.inspectorEl) {
-                                const sym = unit.model.atomicHierarchy.derived.atoms.type_symbol.value(idx);
-                                const x = unit.model.atomicConformation.x[idx];
-                                const y = unit.model.atomicConformation.y[idx];
-                                const z = unit.model.atomicConformation.z[idx];
-                                const info = ELEMENT_DATA[sym] || { name: sym, number: '?' };
-                                this.inspectorEl.style.color = '#38bdf8';
-                                this.inspectorEl.textContent = `🔍 ${info.name} (${sym} #${info.number}) · [${x.toFixed(2)}, ${y.toFixed(2)}, ${z.toFixed(2)}] Å`;
-                            }
-                        } catch (_) {}
-                    }
-                });
-
-                // Interactive Atom, Distance & Angle Measurement Tool
-                this.pluginInstance.behaviors.interaction.click.subscribe((event: any) => {
-                    const loci = event.current.loci;
-                    if (loci && loci.kind === 'element-loci') {
-                        try {
-                            const unit = loci.elements[0]?.unit;
-                            const idx = loci.elements[0]?.indices[0];
-                            if (unit && idx !== undefined) {
-                                const sym = unit.model.atomicHierarchy.derived.atoms.type_symbol.value(idx);
-                                const x = unit.model.atomicConformation.x[idx];
-                                const y = unit.model.atomicConformation.y[idx];
-                                const z = unit.model.atomicConformation.z[idx];
-
-                                this.clickHistory.push({ sym, x, y, z });
-
-                                if (this.clickHistory.length === 1 && this.inspectorEl) {
-                                    this.inspectorEl.style.color = '#fde047';
-                                    this.inspectorEl.textContent = `📍 Selected ${sym} · Click next atom to measure`;
-                                    new Notice(`Selected ${sym} [${x.toFixed(2)}, ${y.toFixed(2)}, ${z.toFixed(2)}]`);
-                                } else if (this.clickHistory.length === 2 && this.inspectorEl) {
-                                    const p1 = this.clickHistory[0], p2 = this.clickHistory[1];
-                                    const dist = Math.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2 + (p1.z - p2.z)**2);
-                                    this.inspectorEl.style.color = '#4ade80';
-                                    this.inspectorEl.textContent = `📏 Distance (${p1.sym}—${p2.sym}): ${dist.toFixed(3)} Å`;
-                                    new Notice(`📏 Distance (${p1.sym}—${p2.sym}): ${dist.toFixed(3)} Å\nClick a 3rd atom for bond angle`);
-                                } else if (this.clickHistory.length === 3 && this.inspectorEl) {
-                                    const p1 = this.clickHistory[0], p2 = this.clickHistory[1], p3 = this.clickHistory[2];
-                                    const v1 = { x: p1.x - p2.x, y: p1.y - p2.y, z: p1.z - p2.z };
-                                    const v2 = { x: p3.x - p2.x, y: p3.y - p2.y, z: p3.z - p2.z };
-                                    const dot = v1.x * v2.x + v1.y * v2.y + v1.z * v2.z;
-                                    const len1 = Math.sqrt(v1.x**2 + v1.y**2 + v1.z**2);
-                                    const len2 = Math.sqrt(v2.x**2 + v2.y**2 + v2.z**2);
-                                    const angle = Math.acos(Math.max(-1, Math.min(1, dot / (len1 * len2)))) * (180 / Math.PI);
-                                    this.inspectorEl.style.color = '#c084fc';
-                                    this.inspectorEl.textContent = `📐 Angle (${p1.sym}—${p2.sym}—${p3.sym}): ${angle.toFixed(1)}°`;
-                                    new Notice(`📐 Angle (${p1.sym}—${p2.sym}—${p3.sym}): ${angle.toFixed(1)}°`);
-                                    this.clickHistory = [];
-                                }
-                            }
-                        } catch (_) {}
-                    }
-                });
+                this.attachInteractions();
             }
 
             const isDark = document.body.classList.contains('theme-dark');
@@ -831,7 +849,9 @@ class MolstarRenderChild extends MarkdownRenderChild {
             
             if (this.pluginInstance.canvas3d) {
                 this.pluginInstance.canvas3d.setProps({
-                    renderer: { backgroundColor: bgColor },
+                    // A session restores the background it was saved with; overriding it
+                    // would stop the viewer from reproducing what the author set up.
+                    ...(sessionFile ? {} : { renderer: { backgroundColor: bgColor } }),
                     pixelScale: this.settings.maxPixelRatio
                 });
 
@@ -944,12 +964,151 @@ class MolstarRenderChild extends MarkdownRenderChild {
                         });
                     }
                 );
+
+                // 4. Snapshot stepper - a session can hold a sequence of states, and
+                // without this only the one it opened on would ever be visible.
+                const snapshots = this.pluginInstance?.managers?.snapshot;
+                const snapshotCount = sessionFile ? (snapshots?.state?.entries?.size ?? 0) : 0;
+                if (snapshotCount > 1) {
+                    const counter = document.createElement('div');
+                    Object.assign(counter.style, {
+                        color: '#d4d4d8',
+                        fontSize: '11px',
+                        fontFamily: 'monospace',
+                        display: 'flex',
+                        alignItems: 'center',
+                        padding: '0 3px',
+                        userSelect: 'none'
+                    });
+
+                    const updateCounter = () => {
+                        const current = snapshots.current;
+                        const index = current ? snapshots.getIndex(current) : 0;
+                        counter.textContent = `${index + 1}/${snapshotCount}`;
+                    };
+
+                    const step = async (dir: -1 | 1) => {
+                        try {
+                            await snapshots.applyNext(dir);
+                        } catch (_) {}
+                        updateCounter();
+                    };
+
+                    createBtn(`<path d="M15 18l-6-6 6-6"/>`, 'Previous snapshot', () => { void step(-1); });
+                    toolbar.appendChild(counter);
+                    createBtn(`<path d="M9 18l6-6-6-6"/>`, 'Next snapshot', () => { void step(1); });
+                    updateCounter();
+                }
             }
 
         } catch (err) {
             const errDiv = this.containerEl.createDiv({ cls: "color-red", text: `ChemRender3D Error: ${err.message || err}` });
             errDiv.style.padding = '8px';
         }
+    }
+
+    /**
+     * Apply a new embed size to a viewer that is already running. Rebuilding the Mol*
+     * instance for a size change would drop the WebGL context and the loaded structure,
+     * which is both slow and visibly disruptive while the size is being typed.
+     */
+    applySize(size: EmbedSize) {
+        this.renderData.width = size.width;
+        this.renderData.height = size.height;
+
+        if (!this.rootWrapper) return;
+        this.rootWrapper.style.width = size.width || '100%';
+        this.rootWrapper.style.height = size.height || this.settings.viewerHeight;
+
+        // Mol* has a ResizeObserver on the canvas, but it is debounced; ask directly.
+        try {
+            this.pluginInstance?.handleResize();
+        } catch (_) {}
+    }
+
+    /**
+     * Load a saved Mol* session (.molx zip / .molj JSON) straight into the plugin state.
+     * Mol*'s own `open` swallows read errors and only logs them, so success is detected
+     * from the `opened` event rather than from the absence of a throw.
+     */
+    async loadSession(file: TFile) {
+        const buffer = await this.pluginApp.vault.readBinary(file);
+        const sessionBlob = new File([buffer], file.name);
+
+        let opened = false;
+        const sub = this.pluginInstance.managers.snapshot.events.opened.subscribe(() => { opened = true; });
+        try {
+            await this.pluginInstance.managers.snapshot.open(sessionBlob);
+        } finally {
+            sub.unsubscribe();
+        }
+
+        if (!opened) throw new Error(`Could not read Mol* session "${file.name}"`);
+    }
+
+    attachInteractions() {
+        // Live Hover Feedback
+        this.pluginInstance.behaviors.interaction.hover.subscribe((event: any) => {
+            const loci = event.current.loci;
+            if (loci && loci.kind === 'element-loci') {
+                try {
+                    const unit = loci.elements[0]?.unit;
+                    const idx = loci.elements[0]?.indices[0];
+                    if (unit && idx !== undefined && this.inspectorEl) {
+                        const sym = unit.model.atomicHierarchy.derived.atoms.type_symbol.value(idx);
+                        const x = unit.model.atomicConformation.x[idx];
+                        const y = unit.model.atomicConformation.y[idx];
+                        const z = unit.model.atomicConformation.z[idx];
+                        const info = ELEMENT_DATA[sym] || { name: sym, number: '?' };
+                        this.inspectorEl.style.color = '#38bdf8';
+                        this.inspectorEl.textContent = `🔍 ${info.name} (${sym} #${info.number}) · [${x.toFixed(2)}, ${y.toFixed(2)}, ${z.toFixed(2)}] Å`;
+                    }
+                } catch (_) {}
+            }
+        });
+
+        // Interactive Atom, Distance & Angle Measurement Tool
+        this.pluginInstance.behaviors.interaction.click.subscribe((event: any) => {
+            const loci = event.current.loci;
+            if (loci && loci.kind === 'element-loci') {
+                try {
+                    const unit = loci.elements[0]?.unit;
+                    const idx = loci.elements[0]?.indices[0];
+                    if (unit && idx !== undefined) {
+                        const sym = unit.model.atomicHierarchy.derived.atoms.type_symbol.value(idx);
+                        const x = unit.model.atomicConformation.x[idx];
+                        const y = unit.model.atomicConformation.y[idx];
+                        const z = unit.model.atomicConformation.z[idx];
+
+                        this.clickHistory.push({ sym, x, y, z });
+
+                        if (this.clickHistory.length === 1 && this.inspectorEl) {
+                            this.inspectorEl.style.color = '#fde047';
+                            this.inspectorEl.textContent = `📍 Selected ${sym} · Click next atom to measure`;
+                            new Notice(`Selected ${sym} [${x.toFixed(2)}, ${y.toFixed(2)}, ${z.toFixed(2)}]`);
+                        } else if (this.clickHistory.length === 2 && this.inspectorEl) {
+                            const p1 = this.clickHistory[0], p2 = this.clickHistory[1];
+                            const dist = Math.sqrt((p1.x - p2.x)**2 + (p1.y - p2.y)**2 + (p1.z - p2.z)**2);
+                            this.inspectorEl.style.color = '#4ade80';
+                            this.inspectorEl.textContent = `📏 Distance (${p1.sym}—${p2.sym}): ${dist.toFixed(3)} Å`;
+                            new Notice(`📏 Distance (${p1.sym}—${p2.sym}): ${dist.toFixed(3)} Å\nClick a 3rd atom for bond angle`);
+                        } else if (this.clickHistory.length === 3 && this.inspectorEl) {
+                            const p1 = this.clickHistory[0], p2 = this.clickHistory[1], p3 = this.clickHistory[2];
+                            const v1 = { x: p1.x - p2.x, y: p1.y - p2.y, z: p1.z - p2.z };
+                            const v2 = { x: p3.x - p2.x, y: p3.y - p2.y, z: p3.z - p2.z };
+                            const dot = v1.x * v2.x + v1.y * v2.y + v1.z * v2.z;
+                            const len1 = Math.sqrt(v1.x**2 + v1.y**2 + v1.z**2);
+                            const len2 = Math.sqrt(v2.x**2 + v2.y**2 + v2.z**2);
+                            const angle = Math.acos(Math.max(-1, Math.min(1, dot / (len1 * len2)))) * (180 / Math.PI);
+                            this.inspectorEl.style.color = '#c084fc';
+                            this.inspectorEl.textContent = `📐 Angle (${p1.sym}—${p2.sym}—${p3.sym}): ${angle.toFixed(1)}°`;
+                            new Notice(`📐 Angle (${p1.sym}—${p2.sym}—${p3.sym}): ${angle.toFixed(1)}°`);
+                            this.clickHistory = [];
+                        }
+                    }
+                } catch (_) {}
+            }
+        });
     }
 
     onunload() {
@@ -983,7 +1142,7 @@ class Molstar2DRenderChild extends MarkdownRenderChild {
 
     async onload() {
         const card = this.containerEl.createDiv({
-            style: 'width: 220px; background: var(--background-secondary); border-radius: 8px; border: 1px solid var(--background-modifier-border); padding: 8px; cursor: pointer; display: flex; flex-direction: column; gap: 6px; transition: transform 0.15s, border-color 0.15s; margin: 10px 0;'
+            style: `width: ${this.renderData.width || '220px'}; max-width: 100%; background: var(--background-secondary); border-radius: 8px; border: 1px solid var(--background-modifier-border); padding: 8px; cursor: pointer; display: flex; flex-direction: column; gap: 6px; transition: transform 0.15s, border-color 0.15s; margin: 10px 0;`
         });
 
         card.onmouseenter = () => { card.style.borderColor = 'var(--interactive-accent)'; card.style.transform = 'translateY(-2px)'; };
@@ -993,7 +1152,7 @@ class Molstar2DRenderChild extends MarkdownRenderChild {
         const titleEl = card.createDiv({ text: titleText, style: 'font-size: 0.85em; font-weight: bold; text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;' });
         titleEl.title = titleText;
 
-        const previewBox = card.createDiv({ style: 'height: 140px; width: 100%; display: flex; align-items: center; justify-content: center; background: #ffffff; border-radius: 6px; overflow: hidden;' });
+        const previewBox = card.createDiv({ style: `height: ${this.renderData.height || '140px'}; width: 100%; display: flex; align-items: center; justify-content: center; background: #ffffff; border-radius: 6px; overflow: hidden;` });
         const badgeEl = card.createDiv({ style: 'font-size: 10px; color: var(--text-muted); text-align: center; font-family: monospace;' });
 
         let rawText = '';
@@ -1002,8 +1161,11 @@ class Molstar2DRenderChild extends MarkdownRenderChild {
         if (this.renderData.type === 'file') {
             const file = resolveVaultFile(this.pluginApp, this.renderData.content, this.renderData.sourcePath);
             if (file) {
-                rawText = await this.pluginApp.vault.read(file);
                 detected = detectFormat(file) || '';
+                // A session holds no plain atom list to flatten, and .molx is binary.
+                if (!isSessionFormat(detected)) {
+                    rawText = await this.pluginApp.vault.read(file);
+                }
             }
         } else if (this.renderData.type === 'raw_vasp') {
             rawText = this.renderData.content;
@@ -1050,7 +1212,8 @@ class Molstar2DRenderChild extends MarkdownRenderChild {
             previewBox.innerHTML = renderOffline2DSvg(atoms, bonds);
             badgeEl.setText(formula);
         } else {
-            previewBox.innerHTML = `<span style="font-size:10px; color:#888;">Preview unavailable</span>`;
+            const message = isSessionFormat(detected) ? 'Mol* session — open in 3D' : 'Preview unavailable';
+            previewBox.innerHTML = `<span style="font-size:10px; color:#888;">${message}</span>`;
         }
 
         card.onclick = (e) => {
@@ -1082,8 +1245,8 @@ export default class ChemRender3DPlugin extends Plugin {
 
             const filenameMatch = trimmed.match(/^!?\[\[(.*?)\]\]$/);
             if (filenameMatch && filenameMatch[1]) {
-                const clean = decodeURIComponent(filenameMatch[1]).split('#')[0].split('|')[0].trim();
-                ctx.addChild(new MolstarRenderChild(el, { type: 'file', content: clean, sourcePath: ctx.sourcePath }, this.app, this.settings));
+                const { path: clean, size } = parseEmbedLink(filenameMatch[1]);
+                ctx.addChild(new MolstarRenderChild(el, { type: 'file', content: clean, sourcePath: ctx.sourcePath, ...size }, this.app, this.settings));
                 return;
             }
 
@@ -1092,6 +1255,7 @@ export default class ChemRender3DPlugin extends Plugin {
                 let target = '';
                 let type: any = 'file';
                 let supercell = undefined;
+                let size: EmbedSize = {};
 
                 for (const line of lines) {
                     const idx = line.indexOf(':');
@@ -1101,12 +1265,19 @@ export default class ChemRender3DPlugin extends Plugin {
                     if (['file', 'pdb', 'afdb', 'pubchem', 'smiles'].includes(k)) {
                         type = k;
                         target = v.replace(/^!?\[\[/, '').replace(/\]\]$/, '');
+                        // Only a vault link can carry a size suffix; a SMILES string may
+                        // legitimately contain '#', which parseEmbedLink would cut off.
+                        if (k === 'file') {
+                            const parsed = parseEmbedLink(target);
+                            target = parsed.path;
+                            size = parsed.size;
+                        }
                     } else if (k === 'supercell') {
                         supercell = v;
                     }
                 }
                 if (target) {
-                    ctx.addChild(new MolstarRenderChild(el, { type, content: target, sourcePath: ctx.sourcePath, supercell }, this.app, this.settings));
+                    ctx.addChild(new MolstarRenderChild(el, { type, content: target, sourcePath: ctx.sourcePath, supercell, ...size }, this.app, this.settings));
                     return;
                 }
             }
@@ -1150,8 +1321,8 @@ export default class ChemRender3DPlugin extends Plugin {
 
             const filenameMatch = trimmed.match(/^!?\[\[(.*?)\]\]$/);
             if (filenameMatch && filenameMatch[1]) {
-                const clean = decodeURIComponent(filenameMatch[1]).split('#')[0].split('|')[0].trim();
-                ctx.addChild(new Molstar2DRenderChild(el, { type: 'file', content: clean, sourcePath: ctx.sourcePath }, this.app, this.settings));
+                const { path: clean, size } = parseEmbedLink(filenameMatch[1]);
+                ctx.addChild(new Molstar2DRenderChild(el, { type: 'file', content: clean, sourcePath: ctx.sourcePath, ...size }, this.app, this.settings));
                 return;
             }
 
@@ -1249,7 +1420,7 @@ export default class ChemRender3DPlugin extends Plugin {
             if (!folder || !('children' in folder)) return;
 
             const files = (folder as any).children
-                .filter((f: any) => f instanceof TFile && detectFormat(f) !== null)
+                .filter((f: any) => f instanceof TFile && detectFormat(f) !== null && !isSessionFormat(detectFormat(f)))
                 .slice(0, this.settings.gridMaxFiles);
 
             if (files.length === 0) {
@@ -1327,7 +1498,8 @@ export default class ChemRender3DPlugin extends Plugin {
             embeds.forEach((embed) => {
                 const src = embed.getAttribute('src');
                 if (!src) return;
-                const cleanSrc = decodeURIComponent(src).split('#')[0].split('?')[0].split('|')[0].trim();
+                const { path: cleanSrc } = parseEmbedLink(src);
+                const size = parseEmbedElementSize(embed, src);
 
                 if (isFileSupported(cleanSrc, this.settings)) {
                     if (embed.hasAttribute('data-chem3d-preview-done')) return;
@@ -1338,7 +1510,9 @@ export default class ChemRender3DPlugin extends Plugin {
                     (embed as HTMLElement).empty();
                     embed.appendChild(container); 
                     
-                    const renderData: RenderData = { type: 'file', content: cleanSrc, sourcePath: context.sourcePath };
+                    applyHostWidth(embed as HTMLElement, size);
+
+                    const renderData: RenderData = { type: 'file', content: cleanSrc, sourcePath: context.sourcePath, ...size };
                     context.addChild(new MolstarRenderChild(container, renderData, this.app, this.settings));
                 }
             });
@@ -1350,7 +1524,10 @@ export default class ChemRender3DPlugin extends Plugin {
     buildLivePreviewPlugin() {
         const plugin = this;
         return ViewPlugin.fromClass(class {
-            activeEmbeds = new Map<HTMLElement, MolstarRenderChild>();
+            // Obsidian reuses the embed element when only the alias changes, so the
+            // rendered spec is tracked here to tell a resize from a different file.
+            activeEmbeds = new Map<HTMLElement, { child: MolstarRenderChild; path: string; size: EmbedSize }>();
+            pending = new Set<HTMLElement>();
             debounceTimer: number | null = null;
 
             constructor(public view: EditorView) {
@@ -1358,16 +1535,16 @@ export default class ChemRender3DPlugin extends Plugin {
             }
 
             update(update: ViewUpdate) {
-                if (update.docChanged || update.viewportChanged) {
+                if (update.docChanged || update.viewportChanged || update.selectionSet) {
                     if (this.debounceTimer) window.clearTimeout(this.debounceTimer);
                     this.debounceTimer = window.setTimeout(() => this.processEmbeds(), 100);
                 }
             }
 
             processEmbeds() {
-                for (const [el, renderChild] of this.activeEmbeds.entries()) {
+                for (const [el, active] of this.activeEmbeds.entries()) {
                     if (!this.view.dom.contains(el)) {
-                        renderChild.onunload();
+                        active.child.onunload();
                         this.activeEmbeds.delete(el);
                     }
                 }
@@ -1377,35 +1554,65 @@ export default class ChemRender3DPlugin extends Plugin {
                 embeds.forEach(embed => {
                     const src = embed.getAttribute('src');
                     if (!src) return;
-                    const cleanSrc = decodeURIComponent(src).split('#')[0].split('?')[0].split('|')[0].trim();
+                    const { path: cleanSrc } = parseEmbedLink(src);
+                    const size = parseEmbedElementSize(embed, src);
 
-                    if (isFileSupported(cleanSrc, plugin.settings)) {
-                        if (embed.hasAttribute('data-chem3d-preview-done')) return;
-                        embed.setAttribute('data-chem3d-preview-done', 'true');
+                    if (!isFileSupported(cleanSrc, plugin.settings)) return;
 
-                        const activeFile = plugin.app.workspace.getActiveFile();
-                        const sourcePath = activeFile ? activeFile.path : "";
-                        
-                        plugin.injectNativeEmbedLivePreview(embed as HTMLElement, cleanSrc, sourcePath).then(child => {
-                            if (child) {
-                                this.activeEmbeds.set(embed as HTMLElement, child);
+                    const el = embed as HTMLElement;
+                    if (this.pending.has(el)) return;
+
+                    const active = this.activeEmbeds.get(el);
+                    if (active) {
+                        const stillMounted = el.contains(active.child.containerEl);
+                        if (stillMounted && active.path === cleanSrc) {
+                            // Same file, only the size suffix moved: resize, do not rebuild.
+                            if (active.size.width !== size.width || active.size.height !== size.height) {
+                                applyHostWidth(el, size);
+                                active.child.applySize(size);
+                                active.size = size;
                             }
-                        });
+                            return;
+                        }
+                        active.child.onunload();
+                        this.activeEmbeds.delete(el);
+                        el.removeAttribute('data-chem3d-preview-done');
                     }
+
+                    if (el.hasAttribute('data-chem3d-preview-done')) {
+                        // The marker also keeps the reading-view processor off this element,
+                        // so only step in once the viewer it stood for has actually gone.
+                        if (el.querySelector('.chem3d-root-wrapper')) return;
+                        el.removeAttribute('data-chem3d-preview-done');
+                    }
+
+                    el.setAttribute('data-chem3d-preview-done', 'true');
+                    this.pending.add(el);
+
+                    const activeFile = plugin.app.workspace.getActiveFile();
+                    const sourcePath = activeFile ? activeFile.path : "";
+
+                    plugin.injectNativeEmbedLivePreview(el, cleanSrc, sourcePath, size)
+                        .then(child => {
+                            if (child) this.activeEmbeds.set(el, { child, path: cleanSrc, size });
+                        })
+                        .finally(() => this.pending.delete(el))
+                        .catch(() => {});
                 });
             }
 
             destroy() {
                 if (this.debounceTimer) window.clearTimeout(this.debounceTimer);
-                for (const renderChild of this.activeEmbeds.values()) {
-                    renderChild.onunload();
+                for (const active of this.activeEmbeds.values()) {
+                    active.child.onunload();
                 }
                 this.activeEmbeds.clear();
+                this.pending.clear();
             }
         });
     }
 
-    async injectNativeEmbedLivePreview(embed: HTMLElement, cleanSrc: string, sourcePath: string): Promise<MolstarRenderChild | null> {
+    async injectNativeEmbedLivePreview(embed: HTMLElement, cleanSrc: string, sourcePath: string, size: EmbedSize = {}): Promise<MolstarRenderChild | null> {
         const file = resolveVaultFile(this.app, cleanSrc, sourcePath);
         if (!file) {
             embed.empty();
@@ -1419,7 +1626,9 @@ export default class ChemRender3DPlugin extends Plugin {
         embed.empty();
         embed.appendChild(container);
 
-        const renderData: RenderData = { type: 'file', content: cleanSrc, sourcePath };
+        applyHostWidth(embed, size);
+
+        const renderData: RenderData = { type: 'file', content: cleanSrc, sourcePath, ...size };
         const renderChild = new MolstarRenderChild(container, renderData, this.app, this.settings);
 
         await renderChild.onload();
@@ -1451,7 +1660,7 @@ class ChemRender3DSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName('Supported File Extensions')
-            .setDesc('Comma-separated extensions to preview automatically (MOL, SDF, VASP, Gaussian, QE, XYZ, PDB, CIF, Cube are natively supported).')
+            .setDesc('Comma-separated extensions to preview automatically (MOL, SDF, VASP, Gaussian, QE, XYZ, PDB, CIF, Cube and Mol* sessions are natively supported).')
             .addText(text => text
                 .setValue(this.plugin.settings.supportedExtensions)
                 .onChange(async (value) => {

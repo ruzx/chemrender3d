@@ -9,11 +9,13 @@ ChemRender3D brings the [Mol*](https://molstar.org/) molecular viewer directly i
 ## Features
 
 * **Native embeds** — Render `.pdb`, `.cif`, `.mol`, `.sdf`, `.xyz`, and other supported molecular files.
+* **Mol\* sessions** — Embed a `.molx` or `.molj` session and get back exactly the scene you saved.
 * **SMILES to 3D** — Generate and visualize 3D molecular structures directly from SMILES.
 * **Interactive visualization** — Rotate, zoom, and inspect structures inside your notes.
 * **Multiple representations** — Explore structures using molecular, ribbon, surface, and illustrative styles.
 * **Molecular interactions** — Detect hydrogen bonds, salt bridges, and other non-covalent interactions.
 * **Performance controls** — Adjust rendering quality for large molecular structures.
+* **Sized embeds** — Set a viewer's width and height with Obsidian's `|WIDTHxHEIGHT` suffix.
 
 
 
@@ -77,6 +79,44 @@ Embed a supported file directly in your note:
 ```
 
 ChemRender3D automatically replaces the file embed with an interactive 3D viewer.
+
+### Set the viewer size
+
+Use Obsidian's usual embed size suffix, in pixels:
+
+```markdown
+![[hemoglobin.pdb|200x500]]   <!-- 200 px wide, 500 px high -->
+
+![[hemoglobin.pdb|300]]       <!-- 300 px wide, default height -->
+```
+
+As with images, a width on its own leaves the height alone — the viewer keeps the
+**Viewer Height** from the plugin settings. The same suffix works inside `3dmol`,
+`2dmol` and `file:` links:
+
+````markdown
+```3dmol
+[[aspirin.mol|640x480]]
+```
+````
+
+### Embed a saved Mol* session
+
+A session saved from the Mol* viewer (**State → Download** in Mol*, or the *Save State* control) can be
+dropped into the vault and embedded like any other structure file:
+
+```markdown
+![[binding-site.molx]]
+```
+
+The session restores its own structures, representations, colour themes, background and camera, so the
+viewer reproduces the scene as it was saved rather than applying the plugin's default preset. Both the
+zipped `.molx` and the plain-JSON `.molj` form work.
+
+If the session contains more than one snapshot, `‹ 1/4 ›` buttons appear in the viewer toolbar for
+stepping through them.
+
+Sessions are 3D only — they carry no flat atom list, so `2dmol` and `2d-grid` skip them.
 
 ### Generate a structure from SMILES
 
