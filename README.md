@@ -21,6 +21,11 @@ ChemRender3D brings the [Mol*](https://molstar.org/) molecular viewer directly i
 
 📝 Release Notes
 
+**⚡ (1.0.5)**
+* **Mol\* sessions** — Embed a `.molx` or `.molj` session and get back exactly the scene you saved. (Thanks @lkndl!)
+* **Sized embeds** — Set a viewer's width and height with Obsidian's `|WIDTHxHEIGHT` suffix. (Thanks @lkndl!)
+
+
 **⚡ (1.0.4)**
 - **Extended Chemical & Material Formats**.
 - **2D Structure Mode:** Toggle between responsive 3D viewports and textbook 2D vector diagrams.
