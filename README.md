@@ -25,6 +25,10 @@ ChemRender3D brings the [Mol*](https://molstar.org/) molecular viewer directly i
 * **Mol\* sessions** — Embed a `.molx` or `.molj` session and get back exactly the scene you saved. (Thanks @lkndl!)
 * **Sized embeds** — Set a viewer's width and height with Obsidian's `|WIDTHxHEIGHT` suffix. (Thanks @lkndl!)
 
+molx/embeds demo:
+
+<img width="800" height="590" alt="molx_stepper" src="https://github.com/user-attachments/assets/acb50e61-53d5-4b49-91f2-a345afedee31" />
+
 
 **⚡ (1.0.4)**
 - **Extended Chemical & Material Formats**.
