@@ -1,8 +1,13 @@
 import { Plugin, PluginSettingTab, App, Setting, TFile, MarkdownRenderChild, requestUrl, Notice, parseYaml, Modal } from 'obsidian';
 import { createPluginUI } from 'molstar/lib/mol-plugin-ui';
 import { renderReact18 } from 'molstar/lib/mol-plugin-ui/react18';
+import { DefaultPluginUISpec } from 'molstar/lib/mol-plugin-ui/spec';
 import { Color } from 'molstar/lib/mol-util/color';
 import { EditorView, ViewPlugin, ViewUpdate } from "@codemirror/view";
+import { computeExtendedHuckel } from './orbitals/eht';
+import { parseMolden } from './orbitals/molden';
+import { OrbitalController } from './orbitals/viewer';
+import { OrbitalSet } from './orbitals/types';
 
 // --- Global Silencing of Mol* duplicate registration spam ---
 const origConsoleWarn = console.warn;
@@ -48,6 +53,12 @@ interface RenderData extends EmbedSize {
     content: string;
     sourcePath: string;
     supercell?: string;
+    /** Open the orbital panel on load: "HOMO", "LUMO+1", "density", "3", or "true". */
+    orbital?: string;
+    /** Relative orbital isovalue (1 = automatic). */
+    iso?: number;
+    /** Total molecular charge for the orbital calculation. */
+    charge?: number;
 }
 
 interface ChemRender3DSettings {
@@ -64,6 +75,9 @@ interface ChemRender3DSettings {
     gridMaxFiles: number;
     defaultGridColumns: number;
     poscarSupercell: string;
+    showOrbitalButton: boolean;
+    orbitalStyle: 'xray' | 'solid';
+    orbitalIso: number;
 }
 
 const DEFAULT_SETTINGS: ChemRender3DSettings = {
@@ -72,14 +86,17 @@ const DEFAULT_SETTINGS: ChemRender3DSettings = {
     showUIPanels: false,
     showQuickToolbar: true,
     viewerHeight: '400px',
-    supportedExtensions: 'pdb, ent, pdbqt, pqr, cif, mmcif, gro, mol, mol2, sdf, sd, xyz, cube, cub, poscar, contcar, xdatcar, vasp, gjf, com, in, pwi, molx, molj',
+    supportedExtensions: 'pdb, ent, pdbqt, pqr, cif, mmcif, gro, mol, mol2, sdf, sd, xyz, cube, cub, poscar, contcar, xdatcar, vasp, gjf, com, in, pwi, molx, molj, molden',
     showNonCovalent: false,
     maxPixelRatio: 1.0,
     preventAppClick: true,
     defaultPreset: 'auto',
     gridMaxFiles: 18,
     defaultGridColumns: 3,
-    poscarSupercell: '1 1 1'
+    poscarSupercell: '1 1 1',
+    showOrbitalButton: true,
+    orbitalStyle: 'xray',
+    orbitalIso: 1
 };
 
 const FORMAT_MAP: Record<string, string> = {
@@ -107,8 +124,14 @@ const FORMAT_MAP: Record<string, string> = {
     'in': 'qe',
     'pwi': 'qe',
     'molx': 'molx',
-    'molj': 'molj'
+    'molj': 'molj',
+    'molden': 'molden',
+    'mold': 'molden',
+    'molf': 'molden'
 };
+
+/** Largest molecule the in-browser Extended Hückel button is offered for. */
+const MAX_EHT_ATOMS = 250;
 
 // Mol* session files (.molx zipped, .molj plain JSON) are whole saved plugin states:
 // they carry their own structures, representations, colours and camera, so they bypass
@@ -248,11 +271,13 @@ function formatPdbRecord(index: number, sym: string, x: number, y: number, z: nu
     return `HETATM${idx} ${atomName} LIG A   1    ${xs}${ys}${zs}  1.00  0.00          ${el}`;
 }
 
-function parseMolFile(text: string): { atoms: { sym: string; x: number; y: number; z: number }[]; bonds: { a1: number; a2: number; type: number }[]; formula: string } {
+function parseMolFile(text: string): { atoms: { sym: string; x: number; y: number; z: number }[]; bonds: { a1: number; a2: number; type: number }[]; formula: string; charge: number } {
     const lines = text.split(/\r?\n/);
     const atoms: { sym: string; x: number; y: number; z: number }[] = [];
     const bonds: { a1: number; a2: number; type: number }[] = [];
     const counts: Record<string, number> = {};
+    let charge = 0;
+    const formulaOf = () => Object.entries(counts).map(([el, c]) => c > 1 ? `${el}${c}` : el).join('') + ` · ${atoms.length} atoms`;
 
     let v2000Idx = -1;
     for (let i = 0; i < Math.min(lines.length, 12); i++) {
@@ -263,40 +288,60 @@ function parseMolFile(text: string): { atoms: { sym: string; x: number; y: numbe
     }
 
     if (v2000Idx !== -1) {
-        const line = lines[v2000Idx].trim();
-        const tokens = line.split(/\s+/);
-        const numAtoms = parseInt(tokens[0], 10);
-        const numBonds = parseInt(tokens[1], 10);
+        // The V2000 counts and atom blocks are fixed-width: with >= 100 atoms or bonds
+        // the fields run together ("100105"), so whitespace splitting is not safe.
+        const countsLine = lines[v2000Idx];
+        const numAtoms = parseInt(countsLine.substring(0, 3), 10) || 0;
+        const numBonds = parseInt(countsLine.substring(3, 6), 10) || 0;
 
         for (let j = 0; j < numAtoms && (v2000Idx + 1 + j) < lines.length; j++) {
-            const atomLine = lines[v2000Idx + 1 + j].trim();
-            const parts = atomLine.split(/\s+/);
-            if (parts.length >= 4) {
-                const x = parseFloat(parts[0]);
-                const y = parseFloat(parts[1]);
-                const z = parseFloat(parts[2]);
-                const sym = parts[3].replace(/[^a-zA-Z]/g, '') || 'C';
-                atoms.push({ sym, x, y, z: isNaN(z) ? 0 : z });
-                counts[sym] = (counts[sym] || 0) + 1;
+            const atomLine = lines[v2000Idx + 1 + j];
+            let x = parseFloat(atomLine.substring(0, 10));
+            let y = parseFloat(atomLine.substring(10, 20));
+            let z = parseFloat(atomLine.substring(20, 30));
+            let sym = atomLine.substring(31, 34).trim().replace(/[^a-zA-Z]/g, '');
+            if (isNaN(x) || isNaN(y) || !sym) {
+                // Not strictly column-aligned: fall back to whitespace tokens.
+                const parts = atomLine.trim().split(/\s+/);
+                x = parseFloat(parts[0]); y = parseFloat(parts[1]); z = parseFloat(parts[2]);
+                sym = (parts[3] || 'C').replace(/[^a-zA-Z]/g, '') || 'C';
             }
+            atoms.push({ sym, x, y, z: isNaN(z) ? 0 : z });
+            counts[sym] = (counts[sym] || 0) + 1;
         }
 
         const bondStart = v2000Idx + 1 + numAtoms;
         for (let k = 0; k < numBonds && (bondStart + k) < lines.length; k++) {
-            const bondLine = lines[bondStart + k].trim();
-            const bParts = bondLine.split(/\s+/);
-            if (bParts.length >= 3) {
-                const a1 = parseInt(bParts[0], 10) - 1;
-                const a2 = parseInt(bParts[1], 10) - 1;
-                const type = parseInt(bParts[2], 10) || 1;
-                if (a1 >= 0 && a1 < atoms.length && a2 >= 0 && a2 < atoms.length) {
-                    bonds.push({ a1, a2, type });
-                }
+            const bondLine = lines[bondStart + k];
+            const a1 = parseInt(bondLine.substring(0, 3), 10) - 1;
+            const a2 = parseInt(bondLine.substring(3, 6), 10) - 1;
+            const type = parseInt(bondLine.substring(6, 9), 10) || 1;
+            if (a1 >= 0 && a1 < atoms.length && a2 >= 0 && a2 < atoms.length) {
+                bonds.push({ a1, a2, type });
             }
         }
 
-        const formula = Object.entries(counts).map(([el, c]) => c > 1 ? `${el}${c}` : el).join('') + ` · ${atoms.length} atoms`;
-        return { atoms, bonds, formula };
+        // Formal charges: "M  CHG  n aaa vvv ..." lines in the properties block.
+        let sawChgLine = false;
+        for (let i = bondStart + numBonds; i < lines.length; i++) {
+            const l = lines[i];
+            if (l.startsWith('M  END') || l.startsWith('$$$$')) break;
+            if (l.startsWith('M  CHG')) {
+                sawChgLine = true;
+                const t = l.substring(6).trim().split(/\s+/).map(Number);
+                for (let k = 1; k + 1 < t.length && k < 1 + 2 * t[0]; k += 2) charge += t[k + 1] || 0;
+            }
+        }
+        if (!sawChgLine) {
+            // Legacy atom-block charge field (column 37-39): 1=+3 2=+2 3=+1 5=-1 6=-2 7=-3.
+            const map: Record<number, number> = { 1: 3, 2: 2, 3: 1, 5: -1, 6: -2, 7: -3 };
+            for (let j = 0; j < numAtoms; j++) {
+                const code = parseInt((lines[v2000Idx + 1 + j] || '').substring(36, 39), 10);
+                charge += map[code] || 0;
+            }
+        }
+
+        return { atoms, bonds, formula: formulaOf(), charge };
     }
 
     for (const l of lines) {
@@ -310,8 +355,40 @@ function parseMolFile(text: string): { atoms: { sym: string; x: number; y: numbe
             }
         }
     }
-    const formula = Object.entries(counts).map(([el, c]) => c > 1 ? `${el}${c}` : el).join('') + ` · ${atoms.length} atoms`;
-    return { atoms, bonds, formula };
+    return { atoms, bonds, formula: formulaOf(), charge };
+}
+
+/**
+ * Fetch a 3D SDF for a compound name / CID or a SMILES string.
+ * SMILES go to PubChem's SMILES endpoint (the name endpoint rejects them) via POST,
+ * because SMILES contain '/', '#' and '\' that do not survive in a URL path.
+ * NCI CACTUS is the fallback for structures PubChem has no 3D conformer for.
+ */
+async function fetchSdf3D(query: string, kind: 'smiles' | 'pubchem'): Promise<string> {
+    const q = query.trim();
+    const looksLikeSdf = (t: string) => /V2000|V3000/.test(t);
+    try {
+        let res;
+        if (/^\d+$/.test(q)) {
+            res = await requestUrl({ url: `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/${q}/SDF?record_type=3d` });
+        } else if (kind === 'smiles') {
+            res = await requestUrl({
+                url: 'https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/smiles/SDF?record_type=3d',
+                method: 'POST',
+                contentType: 'application/x-www-form-urlencoded',
+                body: `smiles=${encodeURIComponent(q)}`
+            });
+        } else {
+            res = await requestUrl({ url: `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/${encodeURIComponent(q)}/SDF?record_type=3d` });
+        }
+        if (looksLikeSdf(res.text)) return res.text;
+    } catch (_) { /* fall through to CACTUS */ }
+
+    const response = await requestUrl({
+        url: `https://cactus.nci.nih.gov/chemical/structure/${encodeURIComponent(q)}/file?format=sdf&get3d=true`
+    });
+    if (!looksLikeSdf(response.text)) throw new Error(`Could not find a 3D structure for "${q}"`);
+    return response.text;
 }
 
 function convertPoscarToPdb(text: string, supercellStr: string = '1 1 1'): { pdbText: string; formula: string; atoms: { sym: string; x: number; y: number; z: number }[] } {
@@ -396,7 +473,10 @@ function convertPoscarToPdb(text: string, supercellStr: string = '1 1 1'): { pdb
 }
 
 function convertXyzToPdb(text: string): { pdbText: string; formula: string; atoms: { sym: string; x: number; y: number; z: number }[] } {
-    const lines = text.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+    // Blank lines must be kept: the XYZ comment line is often empty, and dropping it
+    // shifts every atom line by one (the first atom disappears, the next frame's
+    // count line is read as an atom).
+    const lines = text.split(/\r?\n/).map(l => l.trim());
     const pdb: string[] = [];
     const atoms: { sym: string; x: number; y: number; z: number }[] = [];
     let modelNum = 1;
@@ -407,13 +487,14 @@ function convertXyzToPdb(text: string): { pdbText: string; formula: string; atom
     while (i < lines.length) {
         if (/^\d+$/.test(lines[i])) {
             const count = parseInt(lines[i], 10);
-            i++;
+            // lines[i + 1] is the comment line (possibly empty); atoms follow it.
+            const first = i + 2;
+            if (count === 0 || first + count > lines.length) break;
             if (modelNum === 1) firstModelAtoms = count;
 
             pdb.push(`MODEL     ${padLeft(modelNum.toString(), 4)}`);
-            for (let j = 0; j < count && i + 1 < lines.length; j++) {
-                i++;
-                const parts = lines[i].split(/\s+/);
+            for (let j = 0; j < count; j++) {
+                const parts = lines[first + j].split(/\s+/);
                 const sym = parts[0]?.replace(/[^a-zA-Z]/g, '') || 'C';
                 const x = parseFloat(parts[1]) || 0;
                 const y = parseFloat(parts[2]) || 0;
@@ -427,7 +508,7 @@ function convertXyzToPdb(text: string): { pdbText: string; formula: string; atom
             }
             pdb.push('ENDMDL');
             modelNum++;
-            i++;
+            i = first + count;
         } else {
             i++;
         }
@@ -436,11 +517,16 @@ function convertXyzToPdb(text: string): { pdbText: string; formula: string; atom
 
     const formulaStr = Object.entries(atomCounts).map(([el, c]) => c > 1 ? `${el}${c}` : el).join('');
     const totalModels = modelNum - 1;
-    const formula = totalModels > 1 
+    const formula = totalModels > 1
         ? `${formulaStr} · ${firstModelAtoms} atoms · ${totalModels} frames`
         : `${formulaStr} · ${firstModelAtoms} atoms`;
 
     return { pdbText: pdb.join('\n'), formula, atoms };
+}
+
+/** Plain single-model PDB text for a list of atoms (used for Molden geometries). */
+function atomsToPdb(atoms: { sym: string; x: number; y: number; z: number }[]): string {
+    return atoms.map((a, i) => formatPdbRecord(i + 1, a.sym, a.x, a.y, a.z)).join('\n') + '\nEND';
 }
 
 function convertGaussianToPdb(text: string): { pdbText: string; formula: string; atoms: { sym: string; x: number; y: number; z: number }[] } {
@@ -556,7 +642,7 @@ function renderOffline2DSvg(atoms: { sym: string; x: number; y: number; z: numbe
 class MoleculeModal extends Modal {
     child: MolstarRenderChild | null = null;
 
-    constructor(app: App, private fileOrTarget: { type: 'file' | 'smiles' | 'pubchem' | 'raw_vasp'; content: string }, private title: string, private settings: ChemRender3DSettings) {
+    constructor(app: App, private fileOrTarget: { type: RenderData['type']; content: string }, private title: string, private settings: ChemRender3DSettings) {
         super(app);
     }
 
@@ -602,6 +688,14 @@ class MolstarRenderChild extends MarkdownRenderChild {
     clickHistory: { sym: string; x: number; y: number; z: number }[] = [];
     inspectorEl: HTMLElement | null = null;
     rootWrapper: HTMLElement | null = null;
+    /** Orbitals read from a file (Molden) or computed on demand (Extended Hückel). */
+    orbitalSet: OrbitalSet | null = null;
+    orbitalController: OrbitalController | null = null;
+    /** Formal charge read from the structure (SDF "M  CHG"). */
+    moleculeCharge = 0;
+    /** Periodic structures (POSCAR) are not molecules; EHT on them would be meaningless. */
+    isPeriodic = false;
+    orbitalBusy = false;
 
     constructor(containerEl: HTMLElement, renderData: RenderData, pluginApp: App, settings: ChemRender3DSettings) {
         super(containerEl);
@@ -669,15 +763,17 @@ class MolstarRenderChild extends MarkdownRenderChild {
         }
 
         try {
+            // Layout goes through `spec`: createPluginUI ignores loose layout* options,
+            // which previously left the side panels on regardless of the setting.
+            const baseSpec = DefaultPluginUISpec();
             this.pluginInstance = await createPluginUI({
                 target: viewerContainer,
                 render: renderReact18,
-                layoutIsExpanded: false,
-                layoutShowControls: this.settings.showUIPanels,
-                layoutShowRemoteState: false,
-                layoutShowSequence: true,
-                layoutShowLog: false,
-                layoutShowLeftPanel: this.settings.showUIPanels,
+                spec: {
+                    ...baseSpec,
+                    layout: { initial: { isExpanded: false, showControls: this.settings.showUIPanels } },
+                    components: { ...baseSpec.components, remoteState: 'none' }
+                }
             });
 
             let rawStringData = "";
@@ -691,6 +787,7 @@ class MolstarRenderChild extends MarkdownRenderChild {
                 rawStringData = res.pdbText;
                 formulaLabel = res.formula;
                 this.parsedAtomsList = res.atoms;
+                this.isPeriodic = true;
                 parsedFormat = 'pdb';
 
             } else if (this.renderData.type === 'file') {
@@ -716,10 +813,17 @@ class MolstarRenderChild extends MarkdownRenderChild {
                 } else {
                     const fileText = await this.pluginApp.vault.read(file);
 
-                    if (detected === 'mol' || detected === 'sdf') {
+                    if (detected === 'molden') {
+                        this.orbitalSet = parseMolden(fileText);
+                        this.parsedAtomsList = this.orbitalSet.atoms;
+                        rawStringData = atomsToPdb(this.orbitalSet.atoms);
+                        formulaLabel = `${file.basename} · ${this.orbitalSet.notes[0]}`;
+                        parsedFormat = 'pdb';
+                    } else if (detected === 'mol' || detected === 'sdf') {
                         const res = parseMolFile(fileText);
                         this.parsedAtomsList = res.atoms;
                         this.explicitBondsList = res.bonds;
+                        this.moleculeCharge = res.charge;
                         formulaLabel = res.formula;
                         rawStringData = fileText;
                         parsedFormat = detected;
@@ -729,6 +833,7 @@ class MolstarRenderChild extends MarkdownRenderChild {
                         rawStringData = res.pdbText;
                         formulaLabel = res.formula;
                         this.parsedAtomsList = res.atoms;
+                        this.isPeriodic = true;
                         parsedFormat = 'pdb';
                     } else if (detected === 'xyz' || detected === 'xdatcar') {
                         const res = convertXyzToPdb(fileText);
@@ -750,29 +855,13 @@ class MolstarRenderChild extends MarkdownRenderChild {
 
             } else if (this.renderData.type === 'smiles' || this.renderData.type === 'pubchem') {
                 const query = this.renderData.content.trim();
-                try {
-                    const isCid = /^\d+$/.test(query);
-                    const url = isCid 
-                        ? `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/cid/${query}/SDF?record_type=3d`
-                        : `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/${encodeURIComponent(query)}/SDF?record_type=3d`;
-                    const res = await requestUrl({ url });
-                    rawStringData = res.text;
-                    parsedFormat = 'sdf';
-                    formulaLabel = query.toUpperCase();
-                    const parsed = parseMolFile(rawStringData);
-                    this.parsedAtomsList = parsed.atoms;
-                    this.explicitBondsList = parsed.bonds;
-                } catch {
-                    const response = await requestUrl({
-                        url: `https://cactus.nci.nih.gov/chemical/structure/${encodeURIComponent(query)}/file?format=sdf&get3d=true`
-                    });
-                    rawStringData = response.text;
-                    parsedFormat = 'sdf';
-                    formulaLabel = query;
-                    const parsed = parseMolFile(rawStringData);
-                    this.parsedAtomsList = parsed.atoms;
-                    this.explicitBondsList = parsed.bonds;
-                }
+                rawStringData = await fetchSdf3D(query, this.renderData.type);
+                parsedFormat = 'sdf';
+                formulaLabel = this.renderData.type === 'pubchem' ? query.toUpperCase() : query;
+                const parsed = parseMolFile(rawStringData);
+                this.parsedAtomsList = parsed.atoms;
+                this.explicitBondsList = parsed.bonds;
+                this.moleculeCharge = parsed.charge;
 
             } else if (this.renderData.type === 'pdb') {
                 const response = await requestUrl({
@@ -862,6 +951,11 @@ class MolstarRenderChild extends MarkdownRenderChild {
                 }
             }
 
+            // Orbitals requested in the code block, or always for Molden files.
+            if (this.orbitalSet || this.renderData.orbital) {
+                await this.toggleOrbitals(this.renderData.orbital);
+            }
+
             // Chemical Formula Badge
             if (formulaLabel) {
                 const badge = viewerContainer.createDiv({ text: formulaLabel });
@@ -943,7 +1037,7 @@ class MolstarRenderChild extends MarkdownRenderChild {
                         this.currentMode2D = !this.currentMode2D;
                         if (this.currentMode2D && this.panel2D) {
                             this.panel2D.empty();
-                            const svgContainer = this.panel2D.createDiv({ style: 'width:80%; height:80%; display:flex; align-items:center; justify-content:center;' });
+                            const svgContainer = this.panel2D.createDiv({ attr: { style: 'width:80%; height:80%; display:flex; align-items:center; justify-content:center;' } });
                             svgContainer.innerHTML = renderOffline2DSvg(this.parsedAtomsList, this.explicitBondsList);
                             this.panel2D.style.display = 'flex';
                         } else if (this.panel2D) {
@@ -965,7 +1059,16 @@ class MolstarRenderChild extends MarkdownRenderChild {
                     }
                 );
 
-                // 4. Snapshot stepper - a session can hold a sequence of states, and
+                // 4. Molecular orbitals: Molden data if loaded, else Extended Hückel on demand.
+                if (this.settings.showOrbitalButton && (this.orbitalSet || this.canComputeOrbitals())) {
+                    createBtn(
+                        `<path d="M12 12c-2.6-1.2-4.2-3.6-4.2-6.2a4.2 4.2 0 0 1 8.4 0c0 2.6-1.6 5-4.2 6.2z"/><path d="M12 12c2.6 1.2 4.2 3.6 4.2 6.2a4.2 4.2 0 0 1-8.4 0c0-2.6 1.6-5 4.2-6.2z"/>`,
+                        this.orbitalSet ? 'Molecular orbitals' : 'Molecular orbitals (Extended Hückel)',
+                        () => { void this.toggleOrbitals(); }
+                    );
+                }
+
+                // 5. Snapshot stepper - a session can hold a sequence of states, and
                 // without this only the one it opened on would ever be visible.
                 const snapshots = this.pluginInstance?.managers?.snapshot;
                 const snapshotCount = sessionFile ? (snapshots?.state?.entries?.size ?? 0) : 0;
@@ -1004,6 +1107,51 @@ class MolstarRenderChild extends MarkdownRenderChild {
         } catch (err) {
             const errDiv = this.containerEl.createDiv({ cls: "color-red", text: `ChemRender3D Error: ${err.message || err}` });
             errDiv.style.padding = '8px';
+        }
+    }
+
+    /** EHT is offered for ordinary molecules: atoms known, not periodic, not huge. */
+    canComputeOrbitals(): boolean {
+        const n = this.parsedAtomsList.length;
+        return !this.isPeriodic && n > 0 && n <= MAX_EHT_ATOMS;
+    }
+
+    /** Show or hide the orbital panel, computing orbitals the first time if needed. */
+    async toggleOrbitals(initial?: string) {
+        if (!this.pluginInstance || !this.rootWrapper || this.orbitalBusy) return;
+        if (this.orbitalController) {
+            await this.orbitalController.setVisible(!this.orbitalController.isVisible);
+            return;
+        }
+
+        this.orbitalBusy = true;
+        try {
+            if (!this.orbitalSet) {
+                if (!this.canComputeOrbitals()) {
+                    throw new Error(this.isPeriodic
+                        ? 'Orbitals are not available for periodic crystal structures.'
+                        : `Orbitals need a small molecule with known atoms (up to ${MAX_EHT_ATOMS} atoms).`);
+                }
+                if (this.inspectorEl) this.inspectorEl.textContent = 'Computing molecular orbitals…';
+                // Let the status text paint before the (synchronous) diagonalisation.
+                await new Promise(resolve => window.setTimeout(resolve, 20));
+                this.orbitalSet = computeExtendedHuckel(this.parsedAtomsList, {
+                    charge: this.renderData.charge ?? this.moleculeCharge
+                });
+            }
+            this.orbitalController = new OrbitalController(this.pluginInstance, this.rootWrapper, this.orbitalSet, {
+                initial,
+                iso: this.renderData.iso ?? this.settings.orbitalIso,
+                style: this.settings.orbitalStyle
+            });
+            await this.orbitalController.init();
+            if (this.inspectorEl) this.inspectorEl.textContent = 'Hover/Click atoms to inspect';
+        } catch (e: any) {
+            this.orbitalController = null;
+            if (this.inspectorEl) this.inspectorEl.textContent = 'Hover/Click atoms to inspect';
+            new Notice(`ChemRender3D: ${e?.message || e}`);
+        } finally {
+            this.orbitalBusy = false;
         }
     }
 
@@ -1112,6 +1260,10 @@ class MolstarRenderChild extends MarkdownRenderChild {
     }
 
     onunload() {
+        if (this.orbitalController) {
+            void this.orbitalController.dispose();
+            this.orbitalController = null;
+        }
         if (this.pluginInstance) {
             try {
                 const canvas = this.containerEl.querySelector('canvas');
@@ -1142,18 +1294,18 @@ class Molstar2DRenderChild extends MarkdownRenderChild {
 
     async onload() {
         const card = this.containerEl.createDiv({
-            style: `width: ${this.renderData.width || '220px'}; max-width: 100%; background: var(--background-secondary); border-radius: 8px; border: 1px solid var(--background-modifier-border); padding: 8px; cursor: pointer; display: flex; flex-direction: column; gap: 6px; transition: transform 0.15s, border-color 0.15s; margin: 10px 0;`
+            attr: { style: `width: ${this.renderData.width || '220px'}; max-width: 100%; background: var(--background-secondary); border-radius: 8px; border: 1px solid var(--background-modifier-border); padding: 8px; cursor: pointer; display: flex; flex-direction: column; gap: 6px; transition: transform 0.15s, border-color 0.15s; margin: 10px 0;` }
         });
 
         card.onmouseenter = () => { card.style.borderColor = 'var(--interactive-accent)'; card.style.transform = 'translateY(-2px)'; };
         card.onmouseleave = () => { card.style.borderColor = 'var(--background-modifier-border)'; card.style.transform = 'translateY(0)'; };
 
         const titleText = this.renderData.content.replace(/^!?\[\[/, '').replace(/\]\]$/, '').split('/').pop() || 'Structure';
-        const titleEl = card.createDiv({ text: titleText, style: 'font-size: 0.85em; font-weight: bold; text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;' });
+        const titleEl = card.createDiv({ text: titleText, attr: { style: 'font-size: 0.85em; font-weight: bold; text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;' } });
         titleEl.title = titleText;
 
-        const previewBox = card.createDiv({ style: `height: ${this.renderData.height || '140px'}; width: 100%; display: flex; align-items: center; justify-content: center; background: #ffffff; border-radius: 6px; overflow: hidden;` });
-        const badgeEl = card.createDiv({ style: 'font-size: 10px; color: var(--text-muted); text-align: center; font-family: monospace;' });
+        const previewBox = card.createDiv({ attr: { style: `height: ${this.renderData.height || '140px'}; width: 100%; display: flex; align-items: center; justify-content: center; background: #ffffff; border-radius: 6px; overflow: hidden;` } });
+        const badgeEl = card.createDiv({ attr: { style: 'font-size: 10px; color: var(--text-muted); text-align: center; font-family: monospace;' } });
 
         let rawText = '';
         let detected = '';
@@ -1171,18 +1323,10 @@ class Molstar2DRenderChild extends MarkdownRenderChild {
             rawText = this.renderData.content;
             detected = 'vasp';
         } else if (this.renderData.type === 'smiles' || this.renderData.type === 'pubchem') {
-            const query = this.renderData.content.trim();
             try {
-                const res = await requestUrl({ url: `https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/${encodeURIComponent(query)}/SDF?record_type=3d` });
-                rawText = res.text;
+                rawText = await fetchSdf3D(this.renderData.content, this.renderData.type);
                 detected = 'sdf';
-            } catch {
-                try {
-                    const res = await requestUrl({ url: `https://cactus.nci.nih.gov/chemical/structure/${encodeURIComponent(query)}/file?format=sdf&get3d=true` });
-                    rawText = res.text;
-                    detected = 'sdf';
-                } catch (_) {}
-            }
+            } catch (_) {}
         }
 
         if (rawText) {
@@ -1190,7 +1334,12 @@ class Molstar2DRenderChild extends MarkdownRenderChild {
             let bonds: { a1: number; a2: number; type: number }[] = [];
             let formula = '';
 
-            if (detected === 'mol' || detected === 'sdf') {
+            if (detected === 'molden') {
+                try {
+                    atoms = parseMolden(rawText).atoms;
+                    formula = `${atoms.length} atoms · Molden orbitals`;
+                } catch (_) {}
+            } else if (detected === 'mol' || detected === 'sdf') {
                 const res = parseMolFile(rawText);
                 atoms = res.atoms;
                 bonds = res.bonds;
@@ -1256,6 +1405,9 @@ export default class ChemRender3DPlugin extends Plugin {
                 let type: any = 'file';
                 let supercell = undefined;
                 let size: EmbedSize = {};
+                let orbital: string | undefined;
+                let iso: number | undefined;
+                let charge: number | undefined;
 
                 for (const line of lines) {
                     const idx = line.indexOf(':');
@@ -1274,10 +1426,18 @@ export default class ChemRender3DPlugin extends Plugin {
                         }
                     } else if (k === 'supercell') {
                         supercell = v;
+                    } else if (k === 'orbital' || k === 'orbitals' || k === 'mo') {
+                        orbital = v || 'HOMO';
+                    } else if (k === 'iso' || k === 'isovalue') {
+                        const f = parseFloat(v);
+                        if (!isNaN(f) && f > 0) iso = f;
+                    } else if (k === 'charge') {
+                        const c = parseInt(v, 10);
+                        if (!isNaN(c)) charge = c;
                     }
                 }
                 if (target) {
-                    ctx.addChild(new MolstarRenderChild(el, { type, content: target, sourcePath: ctx.sourcePath, supercell, ...size }, this.app, this.settings));
+                    ctx.addChild(new MolstarRenderChild(el, { type, content: target, sourcePath: ctx.sourcePath, supercell, orbital, iso, charge, ...size }, this.app, this.settings));
                     return;
                 }
             }
@@ -1374,13 +1534,13 @@ export default class ChemRender3DPlugin extends Plugin {
             }
 
             const gridContainer = el.createDiv({
-                style: `display: grid; grid-template-columns: repeat(${cols}, minmax(0, 1fr)); gap: 12px; margin-top: 10px; width: 100%;`
+                attr: { style: `display: grid; grid-template-columns: repeat(${cols}, minmax(0, 1fr)); gap: 12px; margin-top: 10px; width: 100%;` }
             });
             const gridSettings: ChemRender3DSettings = { ...this.settings, showUIPanels: false, showQuickToolbar: false, autoSpinCamera: false, viewerHeight: '200px' };
 
             for (const file of files) {
-                const cell = gridContainer.createDiv({ style: 'display: flex; flex-direction: column; gap: 4px; background: var(--background-secondary); padding: 6px; border-radius: 8px; min-width: 0; overflow: hidden;' });
-                cell.createDiv({ text: file.name, style: 'font-size: 0.85em; font-weight: bold; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: center;' });
+                const cell = gridContainer.createDiv({ attr: { style: 'display: flex; flex-direction: column; gap: 4px; background: var(--background-secondary); padding: 6px; border-radius: 8px; min-width: 0; overflow: hidden;' } });
+                cell.createDiv({ text: file.name, attr: { style: 'font-size: 0.85em; font-weight: bold; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: center;' } });
                 const viewerEl = cell.createDiv();
                 ctx.addChild(new MolstarRenderChild(viewerEl, { type: 'file', content: file.path, sourcePath: ctx.sourcePath }, this.app, gridSettings));
             }
@@ -1429,22 +1589,22 @@ export default class ChemRender3DPlugin extends Plugin {
             }
 
             const gridContainer = el.createDiv({
-                style: `display: grid; grid-template-columns: repeat(${cols}, minmax(0, 1fr)); gap: 10px; margin-top: 10px; width: 100%;`
+                attr: { style: `display: grid; grid-template-columns: repeat(${cols}, minmax(0, 1fr)); gap: 10px; margin-top: 10px; width: 100%;` }
             });
 
             for (const file of files) {
                 const cell = gridContainer.createDiv({
-                    style: 'display:flex; flex-direction:column; gap:4px; background:var(--background-secondary); padding:6px; border-radius:8px; border:1px solid var(--background-modifier-border); cursor:pointer; min-width:0; overflow:hidden; transition:transform 0.15s, border-color 0.15s;'
+                    attr: { style: 'display:flex; flex-direction:column; gap:4px; background:var(--background-secondary); padding:6px; border-radius:8px; border:1px solid var(--background-modifier-border); cursor:pointer; min-width:0; overflow:hidden; transition:transform 0.15s, border-color 0.15s;' }
                 });
 
                 cell.onmouseenter = () => { cell.style.borderColor = 'var(--interactive-accent)'; cell.style.transform = 'translateY(-2px)'; };
                 cell.onmouseleave = () => { cell.style.borderColor = 'var(--background-modifier-border)'; cell.style.transform = 'translateY(0)'; };
 
-                const title = cell.createDiv({ text: file.name, style: 'text-align:center; font-size:0.8em; font-weight:bold; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;' });
+                const title = cell.createDiv({ text: file.name, attr: { style: 'text-align:center; font-size:0.8em; font-weight:bold; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;' } });
                 title.title = file.name;
 
                 const previewBoxHeight = cols >= 4 ? '100px' : (cols === 3 ? '120px' : '150px');
-                const previewBox = cell.createDiv({ style: `height:${previewBoxHeight}; width:100%; display:flex; align-items:center; justify-content:center; background:#ffffff; border-radius:6px; overflow:hidden;` });
+                const previewBox = cell.createDiv({ attr: { style: `height:${previewBoxHeight}; width:100%; display:flex; align-items:center; justify-content:center; background:#ffffff; border-radius:6px; overflow:hidden;` } });
 
                 this.app.vault.read(file).then(fileText => {
                     try {
@@ -1453,7 +1613,10 @@ export default class ChemRender3DPlugin extends Plugin {
                         let bonds: { a1: number; a2: number; type: number }[] = [];
                         let formula = '';
 
-                        if (detected === 'mol' || detected === 'sdf') {
+                        if (detected === 'molden') {
+                            atoms = parseMolden(fileText).atoms;
+                            formula = `${atoms.length} atoms · Molden orbitals`;
+                        } else if (detected === 'mol' || detected === 'sdf') {
                             const res = parseMolFile(fileText);
                             atoms = res.atoms;
                             bonds = res.bonds;
@@ -1475,7 +1638,7 @@ export default class ChemRender3DPlugin extends Plugin {
                         previewBox.innerHTML = renderOffline2DSvg(atoms, bonds);
 
                         if (formula) {
-                            const badge = cell.createDiv({ text: formula, style: 'font-size:9.5px; color:var(--text-muted); text-align:center; font-family:monospace;' });
+                            const badge = cell.createDiv({ text: formula, attr: { style: 'font-size:9.5px; color:var(--text-muted); text-align:center; font-family:monospace;' } });
                             badge.title = formula;
                         }
                     } catch (_) {
@@ -1739,6 +1902,41 @@ class ChemRender3DSettingTab extends PluginSettingTab {
                 .setValue(this.plugin.settings.autoPlayTrajectory)
                 .onChange(async (value) => {
                     this.plugin.settings.autoPlayTrajectory = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        containerEl.createEl('h3', { text: 'Molecular orbitals' });
+
+        new Setting(containerEl)
+            .setName('Show orbital button')
+            .setDesc('Adds an orbital button to small-molecule viewers. Without a .molden file, orbitals are computed in the note with Extended Hückel theory (qualitative, ideal for teaching).')
+            .addToggle(toggle => toggle
+                .setValue(this.plugin.settings.showOrbitalButton)
+                .onChange(async (value) => {
+                    this.plugin.settings.showOrbitalButton = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Orbital surface style')
+            .addDropdown(dropdown => dropdown
+                .addOption('xray', 'Glow (translucent, like the Mol* demo)')
+                .addOption('solid', 'Solid lobes (textbook look)')
+                .setValue(this.plugin.settings.orbitalStyle)
+                .onChange(async (value: any) => {
+                    this.plugin.settings.orbitalStyle = value;
+                    await this.plugin.saveSettings();
+                }));
+
+        new Setting(containerEl)
+            .setName('Default orbital isovalue')
+            .setDesc('1 = automatic contour enclosing ~85% of the orbital. Lower values draw bigger lobes. Override per block with "iso: 0.8".')
+            .addSlider(slider => slider
+                .setLimits(0.3, 3, 0.1)
+                .setValue(this.plugin.settings.orbitalIso)
+                .setDynamicTooltip()
+                .onChange(async (value) => {
+                    this.plugin.settings.orbitalIso = value;
                     await this.plugin.saveSettings();
                 }));
 
